@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vint import ViNT 
+from vint_train.models.vint.vint import ViNT 
 from vint_train.models.vint.modules.depth_encoders import DepthEncoder
 from vint_train.models.vint.modules.fuse_modules import MultimodalContrastiveLoss, CrossModalAttention
 
@@ -59,21 +59,12 @@ class DepthViNT(ViNT):
     def forward(self, obs_img, goal_img, obs_depth=None, goal_depth=None):
         """
         Args:
-            obs_img: RGB observations [B, 3 * context_size, H, W] (note: might include current frame)
+            obs_img: RGB observations [B, 3 * (context_size + 1), H, W]
             goal_img: RGB goal [B, 3, H, W]
-            obs_depth: Depth observations [B, context_size, H, W] or [B, context_size + 1, H, W]
+            obs_depth: Depth observations [B, context_size + 1, H, W]
             goal_depth: Depth goal [B, 1, H, W]
         """
         batch_size = obs_img.shape[0]
-        
-        # Determine number of RGB frames from input
-        num_rgb_frames = obs_img.shape[1] // 3
-        
-        # Check if we have context_size or context_size + 1 frames
-        if num_rgb_frames == self.context_size:
-            # We need to add the current frame to match parent's expectation
-            # The parent ViNT expects context_size + 1 frames total
-            print(f"Warning: Expected {self.context_size + 1} RGB frames, got {num_rgb_frames}. This might cause issues.")
         
         # 1. Get RGB features
         vision_obs_enc = self.encode_obs_stack(obs_img, self.obs_encoder, self.compress_obs_enc, num_channels=3)
@@ -81,25 +72,12 @@ class DepthViNT(ViNT):
 
         # 2. If depth is provided, get depth features and fuse
         if obs_depth is not None and goal_depth is not None:
-            # Adjust depth to match RGB frame count if needed
-            if obs_depth.shape[1] != num_rgb_frames:
-                print(f"Depth frames ({obs_depth.shape[1]}) don't match RGB frames ({num_rgb_frames})")
-                # Pad or trim depth to match
-                if obs_depth.shape[1] < num_rgb_frames:
-                    # Pad with zeros
-                    padding = torch.zeros(batch_size, num_rgb_frames - obs_depth.shape[1], 
-                                        obs_depth.shape[2], obs_depth.shape[3], device=obs_depth.device)
-                    obs_depth = torch.cat([obs_depth, padding], dim=1)
-                else:
-                    # Trim
-                    obs_depth = obs_depth[:, :num_rgb_frames]
-                    
             depth_obs_enc = self.encode_obs_stack(obs_depth, self.depth_encoder, nn.Identity(), num_channels=1)
             depth_goal_enc = self.encode_single(goal_depth, self.depth_goal_encoder, nn.Identity())
 
             # Fuse observation and goal features
             if self.use_cross_attention:
-                # Fuse observation context (B, num_frames, D)
+                # Fuse observation context (B, context_size + 1, D)
                 obs_enc = self.vision_depth_fusion(vision_obs_enc, depth_obs_enc)
                 # Fuse goal (B, D) -> (B, 1, D) for attention
                 goal_enc = self.vision_depth_fusion(
@@ -127,21 +105,8 @@ class DepthViNT(ViNT):
         if len(goal_enc.shape) == 2:
             goal_enc = goal_enc.unsqueeze(1)
             
-        # The parent's decoder expects exactly context_size + 2 tokens
-        # Current obs_enc might have context_size or context_size + 1 frames
-        current_seq_len = obs_enc.shape[1]
-        expected_seq_len = self.context_size + 2
-        
-        if current_seq_len + 1 == expected_seq_len:
-            # We have the right number for obs, just add goal
-            tokens = torch.cat((obs_enc, goal_enc), dim=1)
-        elif current_seq_len == expected_seq_len - 2:
-            # We're missing the "current" frame, duplicate the last one
-            current_frame = obs_enc[:, -1:, :]
-            tokens = torch.cat((obs_enc, current_frame, goal_enc), dim=1)
-        else:
-            raise ValueError(f"Unexpected sequence length. Got {current_seq_len} observations, "
-                           f"expected {expected_seq_len - 1} or {expected_seq_len - 2}")
+        # The decoder expects context_size + 2 tokens total
+        tokens = torch.cat((obs_enc, goal_enc), dim=1)
         
         final_repr = self.decoder(tokens)
 
