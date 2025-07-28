@@ -73,39 +73,33 @@ class DepthViNT(ViNT):
         if obs_depth is not None and goal_depth is not None:
             depth_obs_enc = self.encode_obs_stack(obs_depth, self.depth_encoder, nn.Identity(), num_channels=1)
             depth_goal_enc = self.encode_single(goal_depth, self.depth_goal_encoder, nn.Identity())
-            
-            # Reshape for fusion
-            vision_obs_enc_flat = vision_obs_enc.view(batch_size, -1)
-            depth_obs_enc_flat = depth_obs_enc.view(batch_size, -1)
-            vision_goal_enc_flat = vision_goal_enc.view(batch_size, -1)
-            depth_goal_enc_flat = depth_goal_enc.view(batch_size, -1)
-            
-            # Fuse observation features
+
+            # Fuse observation and goal features
             if self.use_cross_attention:
-                # Add a sequence dimension for attention
-                obs_enc = self.vision_depth_fusion(
-                    vision_obs_enc_flat.unsqueeze(1), 
-                    depth_obs_enc_flat.unsqueeze(1)
-                ).squeeze(1)
+                # Fuse observation context (B, context_size, D)
+                obs_enc = self.vision_depth_fusion(vision_obs_enc, depth_obs_enc)
+                # Fuse goal (B, D) -> (B, 1, D) for attention
                 goal_enc = self.vision_depth_fusion(
-                    vision_goal_enc_flat.unsqueeze(1), 
-                    depth_goal_enc_flat.unsqueeze(1)
+                    vision_goal_enc.unsqueeze(1),
+                    depth_goal_enc.unsqueeze(1)
                 ).squeeze(1)
-            else:
-                obs_enc = self.vision_depth_fusion(torch.cat([vision_obs_enc_flat, depth_obs_enc_flat], dim=-1))
-                goal_enc = self.vision_depth_fusion(torch.cat([vision_goal_enc_flat, depth_goal_enc_flat], dim=-1))
+            else: # Concat + Linear
+                obs_combined = torch.cat([vision_obs_enc, depth_obs_enc], dim=-1)
+                obs_enc = self.vision_depth_fusion(obs_combined)
+
+                goal_combined = torch.cat([vision_goal_enc, depth_goal_enc], dim=-1)
+                goal_enc = self.vision_depth_fusion(goal_combined)
 
             # Store features from the current timestep for contrastive loss
-            last_vision_features = vision_obs_enc.view(batch_size, self.context_size, -1)[:, -1, :]
-            last_depth_features = depth_obs_enc.view(batch_size, self.context_size, -1)[:, -1, :]
-
+            last_vision_features = vision_obs_enc[:, -1, :]
+            last_depth_features = depth_obs_enc[:, -1, :]
+            
         else: # No depth data, use vision features only
-            obs_enc = vision_obs_enc.view(batch_size, -1)
-            goal_enc = vision_goal_enc.view(batch_size, -1)
+            obs_enc = vision_obs_enc
+            goal_enc = vision_goal_enc
             last_vision_features, last_depth_features = None, None
 
         # 3. Reshape and pass to transformer decoder
-        obs_enc = obs_enc.reshape((batch_size, self.context_size, self.obs_encoding_size))
         goal_enc = goal_enc.unsqueeze(1)
         tokens = torch.cat((obs_enc, goal_enc), dim=1)
         final_repr = self.decoder(tokens)
