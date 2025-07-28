@@ -331,9 +331,9 @@ class ViNT_Dataset(Dataset):
             i (int): index to ith datapoint
         Returns:
             Tuple of tensors containing the context, observation, goal, transformed context, transformed observation, transformed goal, distance label, and action label
-                obs_image (torch.Tensor): tensor of shape [3 * context_size, H, W] containing the image of the robot's observation
+                obs_image (torch.Tensor): tensor of shape [3 * (context_size + 1), H, W] containing the image of the robot's observation
                 goal_image (torch.Tensor): tensor of shape [3, H, W] containing the subgoal image 
-                obs_depth (torch.Tensor): tensor of shape [context_size, H, W] containing the depth of the robot's observation
+                obs_depth (torch.Tensor): tensor of shape [context_size + 1, H, W] containing the depth of the robot's observation
                 goal_depth (torch.Tensor): tensor of shape [1, H, W] containing the subgoal depth
                 actions (torch.Tensor): tensor of shape (5, 2) or (5, 4) (if training with angle) containing the action labels from the observation to the goal
                 dist_label (torch.Tensor): tensor of shape (1,) containing the distance labels from the observation to the goal
@@ -344,12 +344,13 @@ class ViNT_Dataset(Dataset):
         f_curr, curr_time, max_goal_dist = self.index_to_data[i]
         f_goal, goal_time, goal_is_negative = self._sample_goal(f_curr, curr_time, max_goal_dist)
 
-        # Define context times
+        # Define context times - we need context_size + 1 frames (including current)
         if self.context_type == "temporal":
+            # Get context_size previous frames + current frame
             context_times = list(
                 range(
                     curr_time - (self.context_size - 1) * self.waypoint_spacing,
-                    curr_time + 1,
+                    curr_time + self.waypoint_spacing,  # Include current time
                     self.waypoint_spacing,
                 )
             )
@@ -357,7 +358,7 @@ class ViNT_Dataset(Dataset):
         else:
             raise ValueError(f"Invalid context type {self.context_type}")
 
-        # Load RGB and Depth images for the context
+        # Load RGB and Depth images for the context (including current frame)
         obs_images = torch.cat([self._load_image(f, t, "rgb") for f, t in context])
         obs_depths = torch.cat([self._load_image(f, t, "depth") for f, t in context])
 
@@ -400,7 +401,6 @@ class ViNT_Dataset(Dataset):
             torch.as_tensor(self.dataset_index, dtype=torch.int64),
             torch.as_tensor(action_mask, dtype=torch.float32),
         )
-
 
 # Since the base class already handles depth, we just create an alias
 ViNTDatasetDepth = ViNT_Dataset
