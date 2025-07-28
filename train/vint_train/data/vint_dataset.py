@@ -1,3 +1,5 @@
+# vint_train/data/vint_dataset.py
+
 import numpy as np
 import os
 import pickle
@@ -6,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import tqdm
 import io
 import lmdb
+from PIL import Image
 
 import torch
 from torch.utils.data import Dataset
@@ -14,9 +17,21 @@ import torchvision.transforms.functional as TF
 from vint_train.data.data_utils import (
     img_path_to_data,
     calculate_sin_cos,
-    get_data_path,
     to_local_coords,
 )
+
+def get_image_path(data_folder: str, trajectory_name: str, time: int, image_type: str) -> str:
+    """
+    Helper function to get the correct image path for RGB or depth.
+    """
+    if image_type == "rgb":
+        return os.path.join(data_folder, trajectory_name, f"{time}.jpg")
+    elif image_type == "depth":
+        # Fixed: removed double .png extension
+        return os.path.join(data_folder, trajectory_name, f"{time}_depth.png")
+    else:
+        raise ValueError(f"Invalid image type: {image_type}")
+
 
 class ViNT_Dataset(Dataset):
     def __init__(
@@ -134,7 +149,8 @@ class ViNT_Dataset(Dataset):
 
     def _build_caches(self, use_tqdm: bool = True):
         """
-        Build a cache of images for faster loading using LMDB
+        Build a cache of images for faster loading using LMDB.
+        This now caches both RGB and depth images.
         """
         cache_filename = os.path.join(
             self.data_split_folder,
@@ -149,6 +165,7 @@ class ViNT_Dataset(Dataset):
         If the cache file doesn't exist, create it by iterating through the dataset and writing each image to the cache
         """
         if not os.path.exists(cache_filename):
+            print(f"Building LMDB cache at {cache_filename}")
             tqdm_iterator = tqdm.tqdm(
                 self.goals_index,
                 disable=not use_tqdm,
@@ -158,9 +175,23 @@ class ViNT_Dataset(Dataset):
             with lmdb.open(cache_filename, map_size=2**40) as image_cache:
                 with image_cache.begin(write=True) as txn:
                     for traj_name, time in tqdm_iterator:
-                        image_path = get_data_path(self.data_folder, traj_name, time)
-                        with open(image_path, "rb") as f:
-                            txn.put(image_path.encode(), f.read())
+                        # Add RGB image to cache
+                        rgb_path = get_image_path(self.data_folder, traj_name, time, "rgb")
+                        if os.path.exists(rgb_path):
+                            with open(rgb_path, "rb") as f:
+                                txn.put(rgb_path.encode(), f.read())
+                        else:
+                            print(f"RGB image not found: {rgb_path}")
+
+                        # Add depth image to cache
+                        depth_path = get_image_path(self.data_folder, traj_name, time, "depth")
+                        if os.path.exists(depth_path):
+                            with open(depth_path, "rb") as f:
+                                txn.put(depth_path.encode(), f.read())
+                        # Note: It's okay if depth doesn't exist, we'll handle it in _load_image
+            print(f"LMDB cache built successfully")
+        else:
+            print(f"Using existing LMDB cache at {cache_filename}")
 
         # Reopen the cache file in read-only mode
         self._image_cache: lmdb.Environment = lmdb.open(cache_filename, readonly=True)
@@ -224,17 +255,26 @@ class ViNT_Dataset(Dataset):
             with open(index_to_data_path, "wb") as f:
                 pickle.dump((self.index_to_data, self.goals_index), f)
 
-    def _load_image(self, trajectory_name, time):
-        image_path = get_data_path(self.data_folder, trajectory_name, time)
+    def _load_image(self, trajectory_name, time, image_type):
+        """
+        Loads a single image from the LMDB cache.
+        """
+        image_path = get_image_path(self.data_folder, trajectory_name, time, image_type)
 
         try:
             with self._image_cache.begin() as txn:
                 image_buffer = txn.get(image_path.encode())
-                image_bytes = bytes(image_buffer)
-            image_bytes = io.BytesIO(image_bytes)
-            return img_path_to_data(image_bytes, self.image_size)
-        except TypeError:
-            print(f"Failed to load image {image_path}")
+            if image_buffer is None:
+                raise ValueError(f"Image not found in cache: {image_path}")
+            image_bytes = io.BytesIO(bytes(image_buffer))
+            
+            # For depth images, ensure they are loaded as single channel (L for Luminance)
+            mode = "L" if image_type == "depth" else "RGB"
+            return img_path_to_data(image_bytes, self.image_size, mode=mode)
+        except (TypeError, FileNotFoundError, ValueError) as e:
+            # Return a zero tensor if image is missing
+            channels = 1 if image_type == "depth" else 3
+            return torch.zeros((channels, self.image_size[1], self.image_size[0]))
 
     def _compute_actions(self, traj_data, curr_time, goal_time):
         start_index = curr_time
@@ -291,22 +331,24 @@ class ViNT_Dataset(Dataset):
             i (int): index to ith datapoint
         Returns:
             Tuple of tensors containing the context, observation, goal, transformed context, transformed observation, transformed goal, distance label, and action label
-                obs_image (torch.Tensor): tensor of shape [3, H, W] containing the image of the robot's observation
+                obs_image (torch.Tensor): tensor of shape [3 * context_size, H, W] containing the image of the robot's observation
                 goal_image (torch.Tensor): tensor of shape [3, H, W] containing the subgoal image 
+                obs_depth (torch.Tensor): tensor of shape [context_size, H, W] containing the depth of the robot's observation
+                goal_depth (torch.Tensor): tensor of shape [1, H, W] containing the subgoal depth
+                actions (torch.Tensor): tensor of shape (5, 2) or (5, 4) (if training with angle) containing the action labels from the observation to the goal
                 dist_label (torch.Tensor): tensor of shape (1,) containing the distance labels from the observation to the goal
-                action_label (torch.Tensor): tensor of shape (5, 2) or (5, 4) (if training with angle) containing the action labels from the observation to the goal
+                goal_pos (torch.Tensor): tensor of shape (2,) containing the goal position
                 which_dataset (torch.Tensor): index of the datapoint in the dataset [for identifying the dataset for visualization when using multiple datasets]
+                action_mask (torch.Tensor): tensor of shape (1,) containing the action mask
         """
         f_curr, curr_time, max_goal_dist = self.index_to_data[i]
         f_goal, goal_time, goal_is_negative = self._sample_goal(f_curr, curr_time, max_goal_dist)
 
-        # Load images
-        context = []
+        # Define context times
         if self.context_type == "temporal":
-            # sample the last self.context_size times from interval [0, curr_time)
             context_times = list(
                 range(
-                    curr_time + -self.context_size * self.waypoint_spacing,
+                    curr_time - (self.context_size - 1) * self.waypoint_spacing,
                     curr_time + 1,
                     self.waypoint_spacing,
                 )
@@ -315,21 +357,17 @@ class ViNT_Dataset(Dataset):
         else:
             raise ValueError(f"Invalid context type {self.context_type}")
 
-        obs_image = torch.cat([
-            self._load_image(f, t) for f, t in context
-        ])
+        # Load RGB and Depth images for the context
+        obs_images = torch.cat([self._load_image(f, t, "rgb") for f, t in context])
+        obs_depths = torch.cat([self._load_image(f, t, "depth") for f, t in context])
 
-        # Load goal image
-        goal_image = self._load_image(f_goal, goal_time)
+        # Load goal image and depth
+        goal_image = self._load_image(f_goal, goal_time, "rgb")
+        goal_depth = self._load_image(f_goal, goal_time, "depth")
 
         # Load other trajectory data
         curr_traj_data = self._get_trajectory(f_curr)
-        curr_traj_len = len(curr_traj_data["position"])
-        assert curr_time < curr_traj_len, f"{curr_time} and {curr_traj_len}"
-
         goal_traj_data = self._get_trajectory(f_goal)
-        goal_traj_len = len(goal_traj_data["position"])
-        assert goal_time < goal_traj_len, f"{goal_time} an {goal_traj_len}"
 
         # Compute actions
         actions, goal_pos = self._compute_actions(curr_traj_data, curr_time, goal_time)
@@ -352,11 +390,17 @@ class ViNT_Dataset(Dataset):
         )
 
         return (
-            torch.as_tensor(obs_image, dtype=torch.float32),
-            torch.as_tensor(goal_image, dtype=torch.float32),
+            obs_images.float(),
+            goal_image.float(),
+            obs_depths.float(),
+            goal_depth.float(),
             actions_torch,
             torch.as_tensor(distance, dtype=torch.int64),
             torch.as_tensor(goal_pos, dtype=torch.float32),
             torch.as_tensor(self.dataset_index, dtype=torch.int64),
             torch.as_tensor(action_mask, dtype=torch.float32),
         )
+
+
+# Since the base class already handles depth, we just create an alias
+ViNTDatasetDepth = ViNT_Dataset

@@ -1,3 +1,5 @@
+# navigate.py: This file shows how observations and goals are processed and how the trajectories are made
+
 from __future__ import annotations
 
 import argparse
