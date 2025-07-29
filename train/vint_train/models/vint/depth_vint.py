@@ -119,6 +119,86 @@ class DepthViNT(ViNT):
 
         # Return predictions and features for contrastive loss
         return dist_pred, action_pred, last_vision_features, last_depth_features
+    
+
+    # ============ TEMPORARILY ADDED CODE FOR DEBUGGING ===============
+    def forward_debug(self, obs_img, goal_img, obs_depth=None, goal_depth=None):
+        """Debug version of forward to track NaN sources"""
+        batch_size = obs_img.shape[0]
+        print(f"\n=== Forward Debug ===")
+        print(f"Input shapes: obs_img={obs_img.shape}, goal_img={goal_img.shape}, obs_depth={obs_depth.shape if obs_depth is not None else None}, goal_depth={goal_depth.shape if goal_depth is not None else None}")
+        print(f"Input ranges: obs_img=[{obs_img.min():.3f}, {obs_img.max():.3f}], obs_depth=[{obs_depth.min():.3f}, {obs_depth.max():.3f}]" if obs_depth is not None else "")
+        
+        # 1. Get RGB features
+        vision_obs_enc = self.encode_obs_stack(obs_img, self.obs_encoder, self.compress_obs_enc, num_channels=3)
+        print(f"vision_obs_enc: shape={vision_obs_enc.shape}, range=[{vision_obs_enc.min():.3f}, {vision_obs_enc.max():.3f}], has_nan={torch.isnan(vision_obs_enc).any()}")
+        
+        vision_goal_enc = self.encode_single(goal_img, self.goal_encoder, self.compress_goal_enc)
+        print(f"vision_goal_enc: shape={vision_goal_enc.shape}, range=[{vision_goal_enc.min():.3f}, {vision_goal_enc.max():.3f}], has_nan={torch.isnan(vision_goal_enc).any()}")
+
+        # 2. If depth is provided, get depth features and fuse
+        if obs_depth is not None and goal_depth is not None:
+            depth_obs_enc = self.encode_obs_stack(obs_depth, self.depth_encoder, nn.Identity(), num_channels=1)
+            print(f"depth_obs_enc: shape={depth_obs_enc.shape}, range=[{depth_obs_enc.min():.3f}, {depth_obs_enc.max():.3f}], has_nan={torch.isnan(depth_obs_enc).any()}")
+            
+            depth_goal_enc = self.encode_single(goal_depth, self.depth_goal_encoder, nn.Identity())
+            print(f"depth_goal_enc: shape={depth_goal_enc.shape}, range=[{depth_goal_enc.min():.3f}, {depth_goal_enc.max():.3f}], has_nan={torch.isnan(depth_goal_enc).any()}")
+
+            # Fuse observation and goal features
+            if self.use_cross_attention:
+                obs_enc = self.vision_depth_fusion(vision_obs_enc, depth_obs_enc)
+                goal_enc = self.vision_depth_fusion(
+                    vision_goal_enc.unsqueeze(1),
+                    depth_goal_enc.unsqueeze(1)
+                ).squeeze(1)
+            else:
+                obs_combined = torch.cat([vision_obs_enc, depth_obs_enc], dim=-1)
+                obs_enc = self.vision_depth_fusion(obs_combined)
+                goal_combined = torch.cat([vision_goal_enc, depth_goal_enc], dim=-1)
+                goal_enc = self.vision_depth_fusion(goal_combined)
+            
+            print(f"After fusion - obs_enc: has_nan={torch.isnan(obs_enc).any()}, goal_enc: has_nan={torch.isnan(goal_enc).any()}")
+
+            # Store features from the current timestep for contrastive loss
+            last_vision_features = vision_obs_enc[:, -1, :]
+            last_depth_features = depth_obs_enc[:, -1, :]
+            
+        else:
+            obs_enc = vision_obs_enc
+            goal_enc = vision_goal_enc
+            last_vision_features, last_depth_features = None, None
+
+        # 3. Reshape and pass to transformer decoder
+        if len(goal_enc.shape) == 2:
+            goal_enc = goal_enc.unsqueeze(1)
+            
+        tokens = torch.cat((obs_enc, goal_enc), dim=1)
+        print(f"tokens: shape={tokens.shape}, has_nan={torch.isnan(tokens).any()}")
+        
+        final_repr = self.decoder(tokens)
+        print(f"final_repr: shape={final_repr.shape}, has_nan={torch.isnan(final_repr).any()}")
+
+        # 4. Predict distance and actions
+        dist_pred = self.dist_predictor(final_repr)
+        action_pred = self.action_predictor(final_repr)
+        print(f"dist_pred: shape={dist_pred.shape}, has_nan={torch.isnan(dist_pred).any()}")
+        print(f"action_pred (before format): shape={action_pred.shape}, has_nan={torch.isnan(action_pred).any()}")
+
+        # 5. Format actions
+        action_pred = self.format_actions(action_pred)
+        print(f"action_pred (after format): shape={action_pred.shape}, has_nan={torch.isnan(action_pred).any()}")
+
+        # Check contrastive loss computation
+        if last_vision_features is not None and last_depth_features is not None:
+            try:
+                test_contrastive_loss = self.contrastive_loss_fn(last_vision_features, last_depth_features)
+                print(f"contrastive_loss test: {test_contrastive_loss.item()}, has_nan={torch.isnan(test_contrastive_loss).any()}")
+            except Exception as e:
+                print(f"Contrastive loss error: {e}")
+
+        return dist_pred, action_pred, last_vision_features, last_depth_features
+    
+    # ============ END CODE FOR DEBUGGING ===============
 
     def encode_obs_stack(self, obs_stack, encoder, compressor, num_channels):
         """Helper to encode a stack of observations."""
