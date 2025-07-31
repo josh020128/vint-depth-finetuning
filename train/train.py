@@ -17,13 +17,12 @@ from warmup_scheduler import GradualWarmupScheduler
 from vint_train.models.vint.vint import ViNT
 from vint_train.models.vint.depth_vint import DepthViNT
 
-# Fixed: Import ViNTDatasetDepth from the same module as ViNT_Dataset
+# Import dataset classes
 from vint_train.data.vint_dataset import ViNT_Dataset, ViNTDatasetDepth
-from vint_train.training.train_eval_loop import (
-    train_eval_loop,
-    train_eval_loop_vint_depth,
-    load_model,
-)
+
+# Import only what we need for DepthViNT training
+from vint_train.training.train_eval_loop import train_eval_loop_vint_depth
+from vint_train.training.train_utils import load_model
 
 
 def main(config):
@@ -70,10 +69,6 @@ def main(config):
     
     if "contrastive_weight" not in config:
         config["contrastive_weight"] = 0.1
-    
-    # Fixed: Add default alpha value
-    if "alpha" not in config:
-        config["alpha"] = 0.5
 
     for dataset_name in config["datasets"]:
         data_config = config["datasets"][dataset_name]
@@ -88,11 +83,8 @@ def main(config):
 
         for data_split_type in ["train", "test"]:
             if data_split_type in data_config:
-                # Choose dataset class based on model type
-                if config["model_type"] == "vint_depth":
-                    dataset_class = ViNTDatasetDepth
-                else:
-                    dataset_class = ViNT_Dataset
+                # For DepthViNT, always use the depth dataset
+                dataset_class = ViNTDatasetDepth
                     
                 dataset = dataset_class(
                     data_folder=data_config["data_folder"],
@@ -119,8 +111,6 @@ def main(config):
                     train_dataset.append(dataset)
                 else:
                     dataset_type = f"{dataset_name}_{data_split_type}"
-                    if dataset_type not in test_dataloaders:
-                        test_dataloaders[dataset_type] = {}
                     test_dataloaders[dataset_type] = dataset
 
     train_dataset = ConcatDataset(train_dataset)
@@ -147,34 +137,20 @@ def main(config):
         )
 
     # --- Model Creation ---
-    if config["model_type"] == "vint":
-        model = ViNT(
-            context_size=config["context_size"],
-            len_traj_pred=config["len_traj_pred"],
-            learn_angle=config["learn_angle"],
-            obs_encoder=config["obs_encoder"],
-            obs_encoding_size=config["obs_encoding_size"],
-            late_fusion=config["late_fusion"],
-            mha_num_attention_heads=config["mha_num_attention_heads"],
-            mha_num_attention_layers=config["mha_num_attention_layers"],
-            mha_ff_dim_factor=config["mha_ff_dim_factor"],
-        )
-    elif config["model_type"] == "vint_depth":
-        model = DepthViNT(
-            context_size=config["context_size"],
-            len_traj_pred=config["len_traj_pred"],
-            learn_angle=config["learn_angle"],
-            obs_encoder=config["obs_encoder"],
-            obs_encoding_size=config["obs_encoding_size"],
-            late_fusion=config["late_fusion"],
-            mha_num_attention_heads=config["mha_num_attention_heads"],
-            mha_num_attention_layers=config["mha_num_attention_layers"],
-            mha_ff_dim_factor=config["mha_ff_dim_factor"],
-            freeze_vision_encoder=True,
-            use_cross_attention=True,
-        )
-    else:
-        raise ValueError(f"Model {config['model_type']} not supported. Use 'vint' or 'vint_depth'.")
+    # For depth fine-tuning, we only support DepthViNT
+    model = DepthViNT(
+        context_size=config["context_size"],
+        len_traj_pred=config["len_traj_pred"],
+        learn_angle=config["learn_angle"],
+        obs_encoder=config["obs_encoder"],
+        obs_encoding_size=config["obs_encoding_size"],
+        late_fusion=config["late_fusion"],
+        mha_num_attention_heads=config["mha_num_attention_heads"],
+        mha_num_attention_layers=config["mha_num_attention_layers"],
+        mha_ff_dim_factor=config["mha_ff_dim_factor"],
+        freeze_vision_encoder=True,
+        use_cross_attention=True,
+    )
 
     if config["clipping"]:
         print("Clipping gradients to", config["max_norm"])
@@ -256,14 +232,14 @@ def main(config):
 
     # If a checkpoint was found (either for resuming or fine-tuning), load the model weights
     if checkpoint_to_load is not None:
-        load_model(model, config["model_type"], checkpoint_to_load)
+        load_model(model, "vint_depth", checkpoint_to_load)
 
     # Move model to device(s)
     if len(config["gpu_ids"]) > 1:
         model = nn.DataParallel(model, device_ids=config["gpu_ids"])
     model = model.to(device)
 
-    # Fixed: Load optimizer and scheduler states only if resuming
+    # Load optimizer and scheduler states only if resuming
     if load_optimizer_and_scheduler and checkpoint_to_load is not None:
         if "optimizer" in checkpoint_to_load:
             optimizer.load_state_dict(checkpoint_to_load["optimizer"])
@@ -272,50 +248,31 @@ def main(config):
             scheduler.load_state_dict(checkpoint_to_load["scheduler"])
             print("Loaded scheduler state from checkpoint")
 
-    # --- Training Loop ---
-    if config["model_type"] == "vint_depth":
-        train_eval_loop_vint_depth(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            dataloader=train_loader,
-            test_dataloaders=test_dataloaders,
-            transform=transform,
-            epochs=config["epochs"],
-            device=device,
-            project_folder=config["project_folder"],
-            normalized=config["normalize"],
-            print_log_freq=config["print_log_freq"],
-            image_log_freq=config["image_log_freq"],
-            num_images_log=config["num_images_log"],
-            current_epoch=current_epoch,
-            learn_angle=config["learn_angle"],
-            contrastive_weight=config["contrastive_weight"],
-            use_wandb=config["use_wandb"],
-            eval_fraction=config["eval_fraction"],
-        )
-    else:  # This will handle the "vint" model type
-        train_eval_loop(
-            train_model=config["train"],
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            dataloader=train_loader,
-            test_dataloaders=test_dataloaders,
-            transform=transform,
-            epochs=config["epochs"],
-            device=device,
-            project_folder=config["project_folder"],
-            normalized=config["normalize"],
-            print_log_freq=config["print_log_freq"],
-            image_log_freq=config["image_log_freq"],
-            num_images_log=config["num_images_log"],
-            current_epoch=current_epoch,
-            learn_angle=config["learn_angle"],
-            alpha=config["alpha"],
-            use_wandb=config["use_wandb"],
-            eval_fraction=config["eval_fraction"],
-        )
+    # --- Training Loop for DepthViNT ---
+    # Get gradient accumulation steps from config
+    gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
+    
+    train_eval_loop_vint_depth(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        dataloader=train_loader,
+        test_dataloaders=test_dataloaders,
+        transform=transform,
+        epochs=config["epochs"],
+        device=device,
+        project_folder=config["project_folder"],
+        normalized=config["normalize"],
+        print_log_freq=config["print_log_freq"],
+        image_log_freq=config["image_log_freq"],
+        num_images_log=config["num_images_log"],
+        current_epoch=current_epoch,
+        learn_angle=config["learn_angle"],
+        contrastive_weight=config["contrastive_weight"],
+        use_wandb=config["use_wandb"],
+        eval_fraction=config["eval_fraction"],
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
 
     print("FINISHED TRAINING")
 
@@ -323,7 +280,7 @@ def main(config):
 if __name__ == "__main__":
     torch.multiprocessing.set_start_method("spawn")
 
-    parser = argparse.ArgumentParser(description="Visual Navigation Transformer")
+    parser = argparse.ArgumentParser(description="Visual Navigation Transformer with Depth")
 
     parser.add_argument(
         "--config",
@@ -355,7 +312,6 @@ if __name__ == "__main__":
         wandb.init(
             project=config["project_name"],
             settings=wandb.Settings(start_method="fork"),
-            entity="your_wandb_entity",  # TODO: change this to your wandb entity
         )
         wandb.save(args.config, policy="now")
         wandb.run.name = config["run_name"]
